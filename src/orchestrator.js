@@ -401,16 +401,19 @@ class Runner {
         const taskText = buildJudgeTask(s, cfg);
         const messages = buildMessages({ session: s, config: cfg, taskText });
         this.emit('judging', { kind: 'judge' });
+        // 裁判用 chat：需要的是「读完实录后的稳定判断」，不是长篇推理，
+        // reasoner 的思考链会吃光 max_tokens 导致正文为空。
         const res = await streamChat({
           apiKey: getApiKey(),
           baseUrl: cfg.baseUrl,
-          model: cfg.model?.includes('reasoner') ? cfg.model : 'deepseek-reasoner',
+          model: 'deepseek-chat',
           messages,
-          maxTokens: 1600,
+          maxTokens: 2600,
+          temperature: 0.6,
           onDelta: (d) => this.emit('judge_delta', { kind: d.type, text: d.text }),
         });
-        s.judge = res.content;
-        accUsage(s, res.usage, 'deepseek-reasoner');
+        s.judge = (res.content || '').trim();
+        accUsage(s, res.usage, 'deepseek-chat');
         this.emit('judge_done', { judge: s.judge });
         this.emit('usage', s.usage);
         this.save();
@@ -442,7 +445,7 @@ class Runner {
       baseUrl: cfg.baseUrl,
       model: cfg.model?.includes('reasoner') ? cfg.model : 'deepseek-chat',
       messages,
-      maxTokens: 4000,
+      maxTokens: 6000,
       onDelta: (d) => this.emit('report_delta', { kind: d.type, text: d.text }),
     });
     accUsage(s, res.usage, 'deepseek-chat');
@@ -460,6 +463,12 @@ class Runner {
     const s = this.session;
     const cfg = s.config;
     const totalWords = s.turns.reduce((a, t) => a + (t.words || 0), 0);
+    // AI 常常自带一级标题，去掉避免与报告头重复
+    let body = String(aiBody || '').replace(/^\s*#\s*[^\n]*\n+/, '').trim();
+    // 有时会漏掉第一节标题，补齐保证结构完整
+    if (!/^##\s*一、/.test(body) && /##\s*二、/.test(body)) {
+      body = `## 一、辩题与赛制\n\n${body}`;
+    }
     const header = [
       `# 辩论复盘报告`,
       ``,
@@ -476,15 +485,24 @@ class Runner {
     ].join('\n');
 
     const sources = collectSources(s);
+    const citations = collectCitations(s);
     const sourceBlock = [
       ``,
       `---`,
       ``,
       `## 附：本场引用来源清单（机器汇总，可逐条核查）`,
       ``,
+      `### 可点击核查的检索来源`,
+      ``,
       ...(sources.length
-        ? sources.map((x, i) => `${i + 1}. ${x.title}${x.site ? ` — ${x.site}` : ''}${x.url ? `\n   ${x.url}` : ''}`)
+        ? sources.map((x, i) => `${i + 1}. ${x.title}${x.site ? ` — ${x.site}` : ''}\n   ${x.url}`)
         : ['（本场未检索到可核查的外部来源）']),
+      ``,
+      `### 辩手在实录中标注的文献（未附链接，需自行核对）`,
+      ``,
+      ...(citations.length
+        ? citations.map((c, i) => `${i + 1}. ${c}`)
+        : ['（无）']),
       ``,
     ].join('\n');
 
@@ -495,7 +513,7 @@ class Runner {
       `*本报告由 AI 辩论室自动生成。辩手发言中的具体数字请以上述来源原文为准；本报告不作为学术引用依据。*`,
     ].join('\n');
 
-    return `${header}${aiBody}${sourceBlock}${footer}`;
+    return `${header}${body}${sourceBlock}${footer}`;
   }
 }
 
@@ -503,7 +521,9 @@ export function collectSources(session) {
   const map = new Map();
   for (const side of ['pro', 'con']) {
     for (const c of session.research?.[side] || []) {
-      if (c.url && !map.has(c.url)) {
+      // 只收录权威来源，广告站和产品官网不进报告
+      if (!c.url || (c.score || 0) < 3) continue;
+      if (!map.has(c.url)) {
         let site = c.site;
         if (!site) { try { site = new URL(c.url).hostname.replace(/^www\./, ''); } catch {} }
         map.set(c.url, { title: c.title || c.url, url: c.url, site });
@@ -518,6 +538,24 @@ export function collectSources(session) {
         try { site = new URL(u).hostname.replace(/^www\./, ''); } catch {}
         map.set(u, { title: site || u, url: u, site });
       }
+    }
+  }
+  return [...map.values()];
+}
+
+/** 辩手在发言里用「（机构，年份）」标注的引用，汇总成文献列表 */
+export function collectCitations(session) {
+  const re = /[（(]([^（）()\n]{2,42}?)[，,]\s*(\d{4})[）)]/g;
+  const map = new Map();
+  for (const t of session.turns || []) {
+    let m;
+    while ((m = re.exec(t.content || ''))) {
+      const name = m[1].trim();
+      const year = m[2];
+      if (!name || /^\d+$/.test(name)) continue;
+      if (/^(约|第|共|每|如|即|例如|其中|所以|因此|但|而|从|到)/.test(name)) continue;
+      const key = `${name}|${year}`;
+      if (!map.has(key)) map.set(key, `${name}（${year}）`);
     }
   }
   return [...map.values()];
@@ -595,6 +633,12 @@ export function controlSession(session, action, payload, emit) {
       session.status = 'paused';
       saveSession(session);
       emit?.('rewound', { phaseIndex: last.phaseIndex });
+      return { ok: true };
+    }
+    case 'conclude': {
+      // 重新跑一遍裁判与报告（辩论已结束时使用）
+      const r = new Runner(session, emit);
+      r.conclude().catch((e) => emit?.('error', { message: e.message }));
       return { ok: true };
     }
     case 'regenerate-report': {
