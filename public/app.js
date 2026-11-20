@@ -174,7 +174,8 @@ function setStatus(status) {
     $('#liveWho').innerHTML = `<b>全场已结束</b><span>${s.turns.length} 次发言 · ${words} 字${dur ? ` · 用时 ${clock(dur)}` : ''}</span>`;
     $('#liveMeta').textContent = `模型 ${s.config.model}｜思考强度 ${s.config.reasoningEffort}`;
     $('#livePeek').textContent = s.judge ? '裁判已裁定，可展开右侧裁定全文' : '报告与完整实录可在右上角导出';
-    $('#liveTimer').textContent = dur ? clock(dur) : '--:--';
+    $('#liveTimer').textContent = dur ? clock(dur) : '';
+    $('#liveTimer').style.display = dur ? '' : 'none';
     $('#liveChars').textContent = `${words} 字`;
     $('#liveThink').textContent = `${fmtNum(s.usage?.reasoningTokens || 0)} tok`;
     $('#barContent').style.width = '100%';
@@ -542,6 +543,7 @@ function renderAll() {
       </div>`;
   }
 
+  state.spyLock = Date.now() + 900; // 初次渲染的自动滚动不触发联动，避免进度轴被拽到中段
   stream.scrollTop = stream.scrollHeight;
 }
 

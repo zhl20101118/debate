@@ -87,6 +87,13 @@ export function renderFullExport(session) {
     out.push('');
   }
 
+  if (session.report) {
+    out.push('## 复盘报告');
+    out.push('');
+    out.push(String(session.report).trim());
+    out.push('');
+  }
+
   if (session.reviewNotes?.length) {
     out.push('## 赛后记忆（已写入下一场的经验）');
     out.push('');
