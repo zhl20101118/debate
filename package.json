@@ -1,0 +1,16 @@
+{
+  "name": "debate-room",
+  "version": "1.0.0",
+  "private": true,
+  "description": "4v4 AI 辩论室 —— 双阵营多辩手实时对线，前缀缓存省 token，本地存储，可导出报告",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}

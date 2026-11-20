@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>AI 辩论室 · 4v4</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚔️</text></svg>" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="aurora"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">⚔</div>
+    <div class="brand-text">
+      <h1>AI 辩论室</h1>
+      <span class="sub">4 v 4 · 双阵营实时对线</span>
+    </div>
+  </div>
+
+  <div class="topic-box">
+    <div class="topic-label">本场辩题</div>
+    <div class="topic-text" id="topicText">加载中…</div>
+  </div>
+
+  <div class="top-right">
+    <div class="status-pill" id="statusPill"><i></i><span>未开始</span></div>
+    <button class="icon-btn" id="btnHistory" title="历史场次">🗂</button>
+    <button class="icon-btn" id="btnSettings" title="设置">⚙</button>
+  </div>
+</header>
+
+<div class="progress-line"><div class="progress-fill" id="progressFill"></div></div>
+
+<div class="controlbar">
+  <div class="ctrl-left">
+    <button class="btn primary" id="btnStart">▶ 开始辩论</button>
+    <button class="btn" id="btnPause">⏸ 暂停</button>
+    <button class="btn" id="btnStep">⏭ 单步</button>
+    <button class="btn ghost" id="btnSkip">跳过环节</button>
+    <button class="btn ghost" id="btnRewind">↩ 撤回</button>
+    <button class="btn danger ghost" id="btnStop">■ 结束</button>
+  </div>
+  <div class="ctrl-right">
+    <div class="now-playing" id="nowPlaying">等待开始</div>
+    <button class="btn subtle" id="btnInject">💬 给主席留言</button>
+    <button class="btn subtle" id="btnReport" disabled>📄 报告</button>
+  </div>
+</div>
+
+<div class="inject-bar" id="injectBar">
+  <input id="injectInput" placeholder="给下一位发言者的临时提示，例如：请正面回应对方关于「认知卸载」的质疑" />
+  <button class="btn primary sm" id="injectSend">发送</button>
+  <button class="btn ghost sm" id="injectCancel">取消</button>
+</div>
+
+<main class="layout">
+  <section class="stage">
+    <div class="stage-head">
+      <div class="side-tag pro">正方<i></i></div>
+      <div class="stage-title">辩 论 实 录</div>
+      <div class="side-tag con"><i></i>反方</div>
+    </div>
+    <div class="stream" id="stream">
+      <div class="empty-state" id="emptyState">
+        <div class="empty-icon">⚔️</div>
+        <h2>辩论室已就绪</h2>
+        <p>八位 AI 辩手已就位，各自带着不同的记忆与风格。<br/>点击「开始辩论」让它们交锋。</p>
+        <div class="empty-hint">提示：资料检索 → 立论 → 驳论 → 质询 → 自由辩论 → 总结，全程可随时暂停与单步</div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="card">
+      <div class="card-title">流程进度 <span class="muted" id="phaseCounter">0/0</span></div>
+      <div class="phase-list" id="phaseList"></div>
+    </div>
+
+    <div class="card usage-card">
+      <div class="card-title">Token 与缓存</div>
+      <div class="usage-main">
+        <div class="ring" id="ring">
+          <svg viewBox="0 0 120 120">
+            <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
+            <circle class="ring-fg" id="ringFg" cx="60" cy="60" r="52"></circle>
+          </svg>
+          <div class="ring-label">
+            <b id="hitRate">0%</b>
+            <span>缓存命中</span>
+          </div>
+        </div>
+        <div class="usage-stats">
+          <div class="stat"><span>累计 Token</span><b id="totalTokens">0</b></div>
+          <div class="stat"><span>命中 / 未命中</span><b id="hitMiss">0 / 0</b></div>
+          <div class="stat"><span>调用次数</span><b id="calls">0</b></div>
+          <div class="stat"><span>估算成本</span><b id="cost">¥0.0000</b></div>
+        </div>
+      </div>
+      <div class="cache-note">所有辩手共享同一段「规则 + 实录」前缀，差异只在最后一条消息 —— 这是命中率高的原因。</div>
+    </div>
+
+    <div class="card research-card">
+      <div class="card-title">资料库</div>
+      <div class="research-tabs">
+        <button class="tab active" data-side="pro">正方 <span id="proCount">0</span></button>
+        <button class="tab" data-side="con">反方 <span id="conCount">0</span></button>
+      </div>
+      <div class="research-list" id="researchList">
+        <div class="muted small">尚未检索</div>
+      </div>
+    </div>
+
+    <div class="card judge-card" id="judgeCard" hidden>
+      <div class="card-title">裁判意见 <button class="link" id="openJudge">展开</button></div>
+      <div class="judge-preview" id="judgePreview"></div>
+    </div>
+  </aside>
+</main>
+
+<!-- 设置抽屉 -->
+<div class="drawer-mask" id="drawerMask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <h2>设置</h2>
+    <button class="icon-btn" id="drawerClose">✕</button>
+  </div>
+  <div class="drawer-body">
+    <div class="field">
+      <label>API Key（DeepSeek）</label>
+      <div class="row">
+        <input type="password" id="apiKeyInput" placeholder="sk-..." autocomplete="off" />
+        <button class="btn sm" id="saveKey">保存</button>
+      </div>
+      <div class="hint" id="keyHint">未配置</div>
+      <div class="hint">只写入本机 <code>data/secrets.json</code>，不会进入代码仓库。</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="field">
+      <label>辩题</label>
+      <input id="cfgTopic" />
+    </div>
+    <div class="field two">
+      <div>
+        <label>正方立场</label>
+        <input id="cfgPro" />
+      </div>
+      <div>
+        <label>反方立场</label>
+        <input id="cfgCon" />
+      </div>
+    </div>
+
+    <div class="field two">
+      <div>
+        <label>模型</label>
+        <select id="cfgModel">
+          <option value="deepseek-chat">deepseek-chat（快、省）</option>
+          <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+        </select>
+      </div>
+      <div>
+        <label>思考强度</label>
+        <select id="cfgEffort">
+          <option value="off">关闭（纯 deepseek-chat，最快最省）</option>
+          <option value="low">低（chat + 简短提示）</option>
+          <option value="medium">中（启用 reasoner 思考）</option>
+          <option value="high">高（reasoner + 深度权衡）</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="field two">
+      <div>
+        <label>自由辩论轮数</label>
+        <input type="number" id="cfgRounds" min="1" max="10" />
+      </div>
+      <div>
+        <label>语速（字/分钟）</label>
+        <input type="number" id="cfgWpm" min="120" max="400" step="10" />
+      </div>
+    </div>
+
+    <div class="field">
+      <label>各环节时长（分钟）</label>
+      <div class="grid4">
+        <div><span>立论</span><input type="number" step="0.5" id="cfgMinOpening" /></div>
+        <div><span>驳论</span><input type="number" step="0.5" id="cfgMinRebuttal" /></div>
+        <div><span>质询</span><input type="number" step="0.5" id="cfgMinCross" /></div>
+        <div><span>自由辩</span><input type="number" step="0.1" id="cfgMinFree" /></div>
+        <div><span>总结</span><input type="number" step="0.5" id="cfgMinSummary" /></div>
+      </div>
+    </div>
+
+    <div class="switch-row">
+      <label class="switch">
+        <input type="checkbox" id="cfgSearch" />
+        <span class="slider"></span>
+        <span class="switch-text">开场前检索权威资料</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="cfgConcise" />
+        <span class="slider"></span>
+        <span class="switch-text">精简上下文（更省 token，但缓存命中下降）</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="cfgJudge" />
+        <span class="slider"></span>
+        <span class="switch-text">结束后生成裁判裁定</span>
+      </label>
+    </div>
+
+    <div class="drawer-actions">
+      <button class="btn primary" id="saveCfg">保存设置</button>
+      <button class="btn ghost" id="resetCfg">恢复默认</button>
+      <button class="btn" id="newDebate">✚ 用此设置新建一场</button>
+    </div>
+  </div>
+</aside>
+
+<!-- 历史 -->
+<aside class="drawer right" id="historyDrawer">
+  <div class="drawer-head">
+    <h2>历史场次</h2>
+    <button class="icon-btn" id="historyClose">✕</button>
+  </div>
+  <div class="drawer-body" id="historyList"></div>
+</aside>
+
+<!-- 报告 -->
+<div class="modal-mask" id="reportMask">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>辩论报告</h2>
+      <div class="modal-actions">
+        <a class="btn sm" id="downloadReport" href="#">下载 .md</a>
+        <button class="icon-btn" id="reportClose">✕</button>
+      </div>
+    </div>
+    <div class="modal-body markdown" id="reportBody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
