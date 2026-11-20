@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>AI 辩论室 · 4v4</title>
+<title>AI 辩论室 · 四对四</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚔️</text></svg>" />
 <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -15,7 +15,7 @@
     <div class="logo">⚔</div>
     <div class="brand-text">
       <h1>AI 辩论室</h1>
-      <span class="sub">4 v 4 · 双阵营实时对线</span>
+      <span class="sub">四对四 · 标准赛制 · 实时对线</span>
     </div>
   </div>
 
@@ -26,6 +26,7 @@
 
   <div class="top-right">
     <div class="status-pill" id="statusPill"><i></i><span>未开始</span></div>
+    <button class="icon-btn" id="btnExport" title="导出完整实录">⤓</button>
     <button class="icon-btn" id="btnHistory" title="历史场次">🗂</button>
     <button class="icon-btn" id="btnSettings" title="设置">⚙</button>
   </div>
@@ -43,8 +44,8 @@
     <button class="btn danger ghost" id="btnStop">■ 结束</button>
   </div>
   <div class="ctrl-right">
-    <div class="now-playing" id="nowPlaying">等待开始</div>
-    <button class="btn subtle" id="btnInject">💬 给主席留言</button>
+    <div class="now-playing" id="nowPlaying"><b>等待开始</b><em id="nowMeta">八位辩手已就位</em></div>
+    <button class="btn subtle" id="btnInject">💬 主席留言</button>
     <button class="btn subtle" id="btnReport" disabled>📄 报告</button>
   </div>
 </div>
@@ -59,27 +60,57 @@
   <section class="stage">
     <div class="stage-head">
       <div class="side-tag pro">正方<i></i></div>
-      <div class="stage-title">辩 论 实 录</div>
+      <div class="stage-title" id="stageTitle">辩 论 实 录</div>
       <div class="side-tag con"><i></i>反方</div>
     </div>
     <div class="stream" id="stream">
       <div class="empty-state" id="emptyState">
         <div class="empty-icon">⚔️</div>
         <h2>辩论室已就绪</h2>
-        <p>八位 AI 辩手已就位，各自带着不同的记忆与风格。<br/>点击「开始辩论」让它们交锋。</p>
-        <div class="empty-hint">提示：资料检索 → 立论 → 驳论 → 质询 → 自由辩论 → 总结，全程可随时暂停与单步</div>
+        <p>八位 AI 辩手已就位，各自带着不同的记忆与风格。<br/>点击「开始辩论」，或先在设置里改辩题与赛制。</p>
+        <div class="empty-hint">资料检索 → 立论 → 驳论 → 质询与应答 → 质询小结 → 自由辩论 → 总结，全程可暂停、单步、撤回</div>
       </div>
     </div>
   </section>
 
   <aside class="side">
-    <div class="card">
-      <div class="card-title">流程进度 <span class="muted" id="phaseCounter">0/0</span></div>
+    <div class="card progress-card">
+      <div class="card-title">
+        <span>流程进度</span>
+        <span class="muted" id="phaseCounter">0/0</span>
+      </div>
       <div class="phase-list" id="phaseList"></div>
+      <div class="axis-note" id="axisNote">点击任意环节可跳到该段发言</div>
+    </div>
+
+    <div class="card live-card" id="liveCard">
+      <div class="card-title">
+        <span>实时状态</span>
+        <span class="live-badge" id="liveBadge">待机</span>
+      </div>
+      <div class="live-who" id="liveWho">尚未开始</div>
+      <div class="live-timer" id="liveTimer">00:00</div>
+      <div class="live-bars">
+        <div class="bar-row">
+          <span>输出</span>
+          <div class="bar"><i id="barContent"></i></div>
+          <b id="liveChars">0/0</b>
+        </div>
+        <div class="bar-row">
+          <span>思考</span>
+          <div class="bar think"><i id="barThink"></i></div>
+          <b id="liveThink">0 字</b>
+        </div>
+      </div>
+      <div class="live-meta" id="liveMeta">模型待定</div>
+      <div class="live-peek" id="livePeek"></div>
     </div>
 
     <div class="card usage-card">
-      <div class="card-title">Token 与缓存</div>
+      <div class="card-title">
+        <span>Token 与缓存</span>
+        <span class="muted" id="lastHit">—</span>
+      </div>
       <div class="usage-main">
         <div class="ring" id="ring">
           <svg viewBox="0 0 120 120">
@@ -88,7 +119,7 @@
           </svg>
           <div class="ring-label">
             <b id="hitRate">0%</b>
-            <span>缓存命中</span>
+            <span>累计命中</span>
           </div>
         </div>
         <div class="usage-stats">
@@ -98,11 +129,16 @@
           <div class="stat"><span>估算成本</span><b id="cost">¥0.0000</b></div>
         </div>
       </div>
-      <div class="cache-note">所有辩手共享同一段「规则 + 实录」前缀，差异只在最后一条消息 —— 这是命中率高的原因。</div>
+      <div class="cache-note">
+        每一次调用都在上一次的消息后面「追加」，历史只增不改 —— 命中的 token 会随轮次单调增长，只有上一段发言与新任务需要重新计费。
+      </div>
     </div>
 
     <div class="card research-card">
-      <div class="card-title">资料库</div>
+      <div class="card-title">
+        <span>资料库</span>
+        <span class="muted small" id="researchQueries">—</span>
+      </div>
       <div class="research-tabs">
         <button class="tab active" data-side="pro">正方 <span id="proCount">0</span></button>
         <button class="tab" data-side="con">反方 <span id="conCount">0</span></button>
@@ -113,8 +149,13 @@
     </div>
 
     <div class="card judge-card" id="judgeCard" hidden>
-      <div class="card-title">裁判意见 <button class="link" id="openJudge">展开</button></div>
+      <div class="card-title">裁判裁定 <button class="link" id="openJudge">展开全文</button></div>
       <div class="judge-preview" id="judgePreview"></div>
+    </div>
+
+    <div class="card memory-card" id="memoryCard" hidden>
+      <div class="card-title">赛后记忆 <span class="muted small">已写入下一场</span></div>
+      <div class="memory-list" id="memoryList"></div>
     </div>
   </aside>
 </main>
@@ -158,17 +199,17 @@
       <div>
         <label>模型</label>
         <select id="cfgModel">
-          <option value="deepseek-chat">deepseek-chat（快、省）</option>
           <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+          <option value="deepseek-chat">deepseek-chat（快、省）</option>
         </select>
       </div>
       <div>
         <label>思考强度</label>
         <select id="cfgEffort">
-          <option value="off">关闭（纯 deepseek-chat，最快最省）</option>
+          <option value="high">高（默认 · 深度权衡）</option>
+          <option value="medium">中</option>
           <option value="low">低（chat + 简短提示）</option>
-          <option value="medium">中（启用 reasoner 思考）</option>
-          <option value="high">高（reasoner + 深度权衡）</option>
+          <option value="off">关闭（纯 chat，最快最省）</option>
         </select>
       </div>
     </div>
@@ -190,8 +231,21 @@
         <div><span>立论</span><input type="number" step="0.5" id="cfgMinOpening" /></div>
         <div><span>驳论</span><input type="number" step="0.5" id="cfgMinRebuttal" /></div>
         <div><span>质询</span><input type="number" step="0.5" id="cfgMinCross" /></div>
-        <div><span>自由辩</span><input type="number" step="0.1" id="cfgMinFree" /></div>
-        <div><span>总结</span><input type="number" step="0.5" id="cfgMinSummary" /></div>
+        <div><span>应答</span><input type="number" step="0.5" id="cfgMinCrossA" /></div>
+        <div><span>小结</span><input type="number" step="0.5" id="cfgMinCrossS" /></div>
+        <div><span>自由辩</span><input type="number" step="0.5" id="cfgMinFree" /></div>
+        <div><span>总结</span><input type="number" step="0.5" id="cfgMinFinal" /></div>
+      </div>
+    </div>
+
+    <div class="field two">
+      <div>
+        <label>记忆轮数（保留近 N 场经验）</label>
+        <input type="number" id="cfgMemoryRounds" min="1" max="20" />
+      </div>
+      <div>
+        <label>系列赛场数（连打）</label>
+        <input type="number" id="cfgSeries" min="1" max="20" />
       </div>
     </div>
 
@@ -202,14 +256,19 @@
         <span class="switch-text">开场前检索权威资料</span>
       </label>
       <label class="switch">
-        <input type="checkbox" id="cfgConcise" />
+        <input type="checkbox" id="cfgMemory" />
         <span class="slider"></span>
-        <span class="switch-text">精简上下文（更省 token，但缓存命中下降）</span>
+        <span class="switch-text">跨场记忆（赛后复盘，带经验上场）</span>
       </label>
       <label class="switch">
         <input type="checkbox" id="cfgJudge" />
         <span class="slider"></span>
         <span class="switch-text">结束后生成裁判裁定</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="cfgAutoReport" />
+        <span class="slider"></span>
+        <span class="switch-text">结束后自动生成复盘报告</span>
       </label>
     </div>
 
@@ -217,6 +276,7 @@
       <button class="btn primary" id="saveCfg">保存设置</button>
       <button class="btn ghost" id="resetCfg">恢复默认</button>
       <button class="btn" id="newDebate">✚ 用此设置新建一场</button>
+      <button class="btn ghost" id="clearMemoryBtn">清空跨场记忆</button>
     </div>
   </div>
 </aside>
@@ -234,7 +294,7 @@
 <div class="modal-mask" id="reportMask">
   <div class="modal">
     <div class="modal-head">
-      <h2>辩论报告</h2>
+      <h2 id="reportTitle">辩论报告</h2>
       <div class="modal-actions">
         <a class="btn sm" id="downloadReport" href="#">下载 .md</a>
         <button class="icon-btn" id="reportClose">✕</button>

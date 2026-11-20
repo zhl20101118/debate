@@ -1,234 +1,243 @@
-// 提示词构建 —— 全部围绕一件事：让 DeepSeek 的前缀缓存能命中。
+// 提示词构建 —— 结构围绕两件事：标准赛制 + DeepSeek 前缀缓存。
 //
-// 结构固定为三条消息：
-//   [0] system  : 全局规则（整场不变，纯固定文本）
-//   [1] user    : 辩论实录（只追加、不修改，天然构成稳定前缀）
-//   [2] user    : 本轮任务（唯一变化的部分，含角色人格）
-// 所有辩手、裁判、报告都共用 [0] 和 [1]，差异只在 [2] 的尾巴上。
+// 消息结构（每一轮都只在上一次的基础上「追加」，前缀永不改写）：
+//   [0] system  全局规则            ← 整场恒定
+//   [1] user    本场简报 BRIEF      ← 整场恒定（辩题/赛制/八人档案/资料库/跨场记忆）
+//   [2] user    第 1 回合任务
+//   [3] assistant 第 1 回合发言原文
+//   [4] user    第 2 回合任务
+//   ...
+// 这样第 n 次调用请求的 messages 是第 n-1 次请求的严格超集，
+// 命中的 token 单调增长，只有「上一段发言 + 本回合任务」是新增未命中。
+// 八位辩手 / 裁判 / 报告 / 赛后复盘全部复用同一段前缀。
+
+import { STAGE_LABEL, formatFlow, resolveModel, effortHint, speakerLabel, sideName } from './config.js';
+
+/* 七类环节的写法要求：放进恒定简报，避免每轮重复计费 */
+const STAGE_RULES = [
+  ['立论', `用两句话点明本题真正的争夺点，并给出你方主张的评判标准（什么情况算提升了思考力）。然后给三个分论点，每个分论点后面必须跟一条真实论据或一个具体到人的场景。最后一句点明你方立场背后的价值，不要煽情。本轮对方尚未发言，不要预判式反驳。`],
+  ['驳论', `第一句直接点名对方一辩立论中最致命的那个漏洞（是第几个分论点、错在哪）。然后用两到三层拆掉它：质疑论据来源与样本、指出被隐藏的前提、或推出对方不愿接受的荒谬结论。收尾用两三句加固你方被攻击的那一点，给出一层对方还没想到的新支撑。不要重复你方一辩的原话。`],
+  ['质询', `向对方连续提 4 到 6 个封闭式问题，能用「是/否」或「哪一个」回答，禁止自问自答。问题必须递进：先问定义，再问边界，再问极端情形，最后一问要让对方承认一个与你方一致的前提。每问单独一行写成「问1：……」，最后用一句话说明这组问题想证明什么。问题要短，一问只打一个点。`],
+  ['应答质询', `逐条回答对方的提问，格式为「问1：…… 答：……」，一个问题都不能漏。先给结论再给理由，每问答控制在 60 字内，不要展开成大段论证。可以拒答明显设套的问题，但要说清拒答理由，不能装没听见。全部答完后用一到两句反击，指出对方整组问题预设了错误前提。`],
+  ['质询小结', `先算账：这一轮质询里对方哪一个问题始终没答、我方哪一个问题已经锁定。把你方拿到的那个承认，写成一条可以直接用的论据。指出对方应答中的自相矛盾，可引用原话片段。最后一句过渡到自由辩论，给出接下来要打的方向。不要重复立论，这一轮是收割。`],
+  ['自由辩论', `第一句必须接住对方刚说过的具体那句话（可引用原话片段），不能换话题。第二句给出一层新的推进，或一个让对方难以两全的反问。全文 3 到 5 句短句，不要分段展开，不要重复队友刚说过的论据。拼的是反应速度，不是论证完整度。`],
+  ['总结陈词', `归纳本场三个核心交锋点，每个一句话说清「争的是什么、我方为何占优、对方哪里没接住」。点出对方整场始终没有正面回答的那个问题，作为收官利器。最后把立场升华到价值层面：人的成长、教育的目的、这一代人的处境。要有感染力，但不要堆排比、不要喊口号。`],
+];
+
+const STAGE_NAME = {
+  opening: '立论',
+  rebuttal: '驳论',
+  crossQ: '质询',
+  crossA: '应答质询',
+  crossSummary: '质询小结',
+  free: '自由辩论',
+  final: '总结陈词',
+};
+const STAGE_INDEX = Object.fromEntries(STAGE_RULES.map(([k], i) => [k, i + 1]));
+function stageNo(phase) {
+  return STAGE_INDEX[STAGE_NAME[phase.type]] || 1;
+}
+
+/* ================= 恒定部分 ================= */
 
 export function buildGlobalSystem(config) {
-  return `你正在参与一场正式的中文四对四辩论赛，全程使用简体中文，以口语化但严谨的辩论腔发言。
+  return `你是中文四对四辩论赛的职业辩手。整场只用简体中文，口语化、有对抗性、可直接念出来。
 
-【辩题】${config.topic}
-【正方立场】${config.proStance}
-【反方立场】${config.conStance}
+【铁律，违反即视为本轮失分】
+1. 立场绝不摇摆。正方就把命题证成，反方就把命题证伪；禁止中立，禁止「双方都有道理」，禁止替对方补论证。
+2. 只写发言本身。禁止「好的」「以下是」「作为 AI」「根据我的分析」这类开场白，禁止 Markdown 标题、加粗、代码块。
+3. 引用必须真实可核查：优先使用【资料库】里的条目，句末用（机构，年份）标注。拿不准具体数字时只描述结论方向，绝不编造精确数字或假论文。
+4. 严禁复述前文。同一论据最多深挖一次，再次出现必须换层次（从事实层换到机制层，或从机制层换到价值层）。
+5. 点名接战。驳论、质询、自由辩论必须先咬住对方刚说过的具体那句话，再展开；不要自说自话。
+6. 字数有硬上限，超出的部分裁判不计分。宁可少说一句有力的，也不要注水。
+7. 不写舞台提示、不写括号动作、不写「（掌声）」。
 
-【赛制】立论 → 驳论 → 攻辩质询 → 自由辩论 → 总结陈词。每位辩手只代表自己一方，依次出场。
-【评判标准】论点是否成立、论据是否可靠可查、逻辑是否自洽、对对方攻击的回应是否有效、价值落点是否有说服力。
-
-【铁律，违反即视为发言失败】
-1. 立场绝不摇摆。你是正方就全力证成，是反方就全力证伪，不能替对方说话，不能中立，不能说"双方都有道理"。
-2. 直接进入发言内容。禁止出现"好的""以下是""作为 AI""根据我的分析"这类开场白或元叙述。
-3. 引用的研究、数据、机构、年份必须真实可核查。若拿不准具体数字，就描述研究结论的取向，不要编造精确数字。凡引用外部资料，在句末用（机构，年份）标注。
-4. 不要大段重复前文。同一论据最多深挖一次，再次出现必须换角度或换层次。
-5. 面向听众讲人话：短句为主，少用嵌套从句，少用"综上所述之逻辑推演"这类翻译腔。
-6. 严格遵守字数要求，超出的部分会被裁判视为失分。
-
-【关于「思考力」的共识边界】辩题中的思考力指：质疑与验证信息的能力、结构化拆解问题的能力、独立形成判断的能力、以及在无辅助条件下迁移运用知识的能力。双方可以争夺这个定义，但不能把它偷换成"记忆力""考试分数"或"使用工具熟练度"。`;
+【赛制】立论 → 驳论 → 质询与应答 → 质询小结 → 自由辩论 → 总结陈词。
+【评判维度】论点成立度、论据可靠度、逻辑自洽度、回应有效性、价值说服力。`;
 }
 
-/** 把已完成发言渲染成实录。必须是确定性函数：同样的 turn 永远得到同样的文本。 */
-export function renderTranscript(turns, config) {
-  const done = (turns || []).filter((t) => t.status === 'done' && t.content);
-  if (!done.length) return '【辩论实录】\n（尚未开始，你是第一位发言者）\n';
-  const parts = ['【辩论实录】'];
-  for (const t of done) {
-    const sideName = t.side === 'pro' ? '正方' : '反方';
-    const who = config.debaters?.[t.side]?.find((d) => d.id === t.speaker);
-    const name = who ? `${who.name}（${sideName}${who.role}）` : `${sideName}${t.speaker}辩`;
-    parts.push(`\n──── 第${t.order}位 · ${name} · ${t.title} ────`);
-    parts.push(t.content.trim());
-    if (t.intervention) parts.push(`（主席提示：${t.intervention}）`);
+/** 本场简报：整场恒定，只构建一次并固化在 session.brief 上 */
+export function buildBrief(session, config, memory) {
+  const cfg = session.config || config;
+  const model = resolveModel(cfg);
+  const blocks = [];
+
+  blocks.push(`【辩题】${cfg.topic}
+【正方立场】${cfg.proStance}
+【反方立场】${cfg.conStance}
+
+【赛制（四对四标准赛制，共 ${Math.round(
+    (session.phases || []).reduce((a, p) => a + p.minutes, 0)
+  )} 分钟）】
+${formatFlow(cfg)}
+
+【关于「思考力」的共识边界】本场的思考力指：质疑与验证信息的能力、结构化拆解问题的能力、独立形成判断的能力、脱离辅助后迁移运用知识的能力。双方可以争夺这个定义，但不能偷换成记忆力、考试分数或工具熟练度。谁偷换定义，谁在裁判处失分。`);
+
+  blocks.push(`【七种环节的写法要求（按顺序编号，本轮只执行编号对应的那一条）】
+${STAGE_RULES.map(([name, text], i) => `${i + 1}. ${name}：${text}`).join('\n')}`);
+
+  // 八人档案：全部放进恒定前缀，本轮只点名「谁出场」
+  const lines = ['【八位辩手档案（同一场内的固定阵容）】'];
+  for (const side of ['pro', 'con']) {
+    for (const d of cfg.debaters?.[side] || []) {
+      const label = speakerLabel(side, d.id);
+      lines.push(
+        `${label}｜${d.name}｜${d.style}｜长项：${d.strengths}｜语气：${d.tone}`
+      );
+    }
   }
-  parts.push('\n──── 实录结束 ────');
-  return parts.join('\n');
+  blocks.push(lines.join('\n'));
+
+  // 资料库：双方共享，公开可引用
+  const research = researchBlock(session);
+  if (research) blocks.push(research);
+
+  // 跨场记忆：同一批辩手打过多场后，带着经验上场
+  if (memory) blocks.push(`【跨场经验（上几场留下的教训，必须体现，但不要说出来）】\n${memory}`);
+
+  blocks.push(`【输出格式】直接给发言正文，按内容自然分段。不要写自己的名字，不要写「正方一辩：」，观众已经从界面知道是你。`);
+  return blocks.join('\n\n');
 }
 
-/** 汇总某一方已经说过的核心论点，帮助本方后续辩手不跑偏、对方辩手有的放矢 */
-export function extractClaims(turns, side, limit = 8) {
-  const own = (turns || []).filter((t) => t.status === 'done' && t.side === side && t.claims?.length);
-  const out = [];
-  for (const t of own) for (const c of t.claims) if (!out.includes(c)) out.push(c);
-  return out.slice(-limit);
-}
-
-/** 抽取对方最近几段发言的开头要点，用于「对方最新论点」 */
-export function recentOpponentPoints(turns, side, config) {
-  const opp = side === 'pro' ? 'con' : 'pro';
-  const rows = (turns || []).filter((t) => t.status === 'done' && t.side === opp).slice(-2);
-  return rows.map((t) => {
-    const who = config.debaters?.[opp]?.find((d) => d.id === t.speaker);
-    const name = who ? who.name : `${opp}方`;
-    const first = (t.content || '').split(/\n+/).filter(Boolean).slice(0, 3).join(' ');
-    return `${name}在「${t.title}」中提到：${first.slice(0, 260)}`;
-  });
-}
-
-const TASK_BY_TYPE = {
-  opening: `这是立论陈词。结构要求：
-① 先用一两句话把辩题的争夺点讲清楚，并给出你方主张的评判标准（什么算提升了思考力）；
-② 抛出三个分论点，每个分论点配一条真实可查的论据或一个具体场景；
-③ 结尾一句话点明你方立场的价值。
-不要回应对方，因为对方还没发言。`,
-  rebuttal: `这是驳论。结构要求：
-① 开头明确指出对方一辩立论中最致命的那个漏洞（点名它是哪一条）；
-② 用两到三个层次拆掉它：可以质疑论据来源、指出样本偏差、或者推出对方不愿接受的荒谬结论；
-③ 顺势加固你方被对方攻击到的论点，给出一层新的支撑。`,
-  crossQ: `这是质询环节，你向对方三辩提问。要求：
-① 连续提出 4 到 6 个问题，全部是封闭式问题（能用"是/否"或"哪一个"回答），不要自问自答；
-② 问题之间要有递进：从定义问到边界，从边界问到极端情形，最后逼对方承认与你方一致的前提；
-③ 每个问题单独成行，用"问1：""问2："编号；
-④ 结尾用一句话说明这组问题想证明什么。`,
-  crossA: `这是应答质询。对方三辩刚刚向你方提问。要求：
-① 逐条回应对方的问题，用"问1：…… 答：……"的格式，一个问题都不要漏；
-② 回答要果断，先给结论再给理由，不要含糊其辞，也不要长篇大论（每问回答控制在 60 字内）；
-③ 全部答完后，用一到两句反击，指出对方的提问预设了错误的前提。`,
-  free: `这是自由辩论，节奏很快，你只有几十秒。要求：
-① 第一句直接回应对方最近一次发言的具体内容，可以引用对方原话的片段；
-② 第二句给出你方的新推进或一个反问；
-③ 全程短句、有节奏，控制在 3 到 5 句，不要展开成大段论证。`,
-  summary: `这是总结陈词，全场最后一次发言。要求：
-① 先归纳本场三个核心交锋点，每个交锋点用一句话说明"争的是什么、我方为何占优"；
-② 指出对方整场始终没有正面回答的那个问题，这是收官的利器；
-③ 结尾升华到你方立场背后的价值（人的成长、教育的目的、这一代人的处境），要有感染力但不能煽情过度。`,
-};
-
-function researchBlock(session, side) {
-  const cards = session.research?.[side];
-  if (!cards?.length) return '';
-  const lines = ['【你方资料库 · 可直接引用，引用时标注（机构，年份）】'];
-  cards.slice(0, 6).forEach((c, i) => {
-    lines.push(`${i + 1}. ${c.title}`);
-    lines.push(`   来源：${c.site || hostOf(c.url)}｜${c.url}`);
-    if (c.digest || c.snippet) lines.push(`   要点：${(c.digest || c.snippet).slice(0, 220)}`);
-  });
-  return lines.join('\n');
+function researchBlock(session) {
+  const pro = session.research?.pro || [];
+  const con = session.research?.con || [];
+  if (!pro.length && !con.length) return '';
+  const fmt = (c, i) => {
+    const bits = [`${i + 1}. 《${trim(c.title, 70)}》`];
+    const meta = [];
+    if (c.site || c.url) meta.push(c.site || hostOf(c.url));
+    if (c.year) meta.push(String(c.year));
+    if (meta.length) bits.push(`— ${meta.join('，')}`);
+    const digest = (c.digest || c.snippet || '').replace(/\s+/g, ' ').trim();
+    if (digest) bits.push(`｜${trim(digest, 150)}`);
+    if (c.url) bits.push(`｜${c.url}`);
+    return bits.join(' ');
+  };
+  const out = ['【资料库 · 双方共享，引用时标注（机构，年份）】'];
+  if (pro.length) {
+    out.push('▸ 偏支持「提升」的条目：');
+    pro.slice(0, 6).forEach((c, i) => out.push(fmt(c, i)));
+  }
+  if (con.length) {
+    out.push('▸ 偏支持「降低」的条目：');
+    con.slice(0, 6).forEach((c, i) => out.push(fmt(c, i)));
+  }
+  out.push('▸ 资料库里没有的内容，可以讲常识与生活场景，但不要伪装成研究结论。');
+  return out.join('\n');
 }
 
 function hostOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
 
-export function buildTurnTask({ session, phase, config }) {
+function trim(s, n) {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+}
+
+/* ================= 历史对话 ================= */
+
+/** 历史实录 → 标准的 user/assistant 对；只追加，不修改 */
+export function buildHistory(session) {
+  const out = [];
+  const cfg = session.config;
+  for (const t of session.turns || []) {
+    if (t.status !== 'done' || !t.content) continue;
+    const min = t.minutes ? `${Math.floor(t.minutes)}:${String(Math.round((t.minutes % 1) * 60)).padStart(2, '0')}` : '';
+    const head = [`【第 ${t.order} 回合】${t.speakerLabel} · ${t.stage}${min ? `（${min}）` : ''}`];
+    if (t.intervention) head.push(`【主席临时提示】${t.intervention}`);
+    out.push({ role: 'user', content: head.join('\n') });
+    out.push({ role: 'assistant', content: String(t.content).trim() });
+  }
+  return out;
+}
+
+/* ================= 本轮任务 ================= */
+
+
+export function buildTurnTask({ session, phase, config, memoryLine, intervention }) {
   const cfg = session.config || config;
-  const side = phase.side;
-  const sideName = side === 'pro' ? '正方' : '反方';
-  const me = cfg.debaters[side].find((d) => d.id === phase.speaker);
-  const stance = side === 'pro' ? cfg.proStance : cfg.conStance;
-
-  const myPrevious = (session.turns || [])
-    .filter((t) => t.status === 'done' && t.side === side && t.speaker === phase.speaker)
-    .map((t) => `· ${t.title}：${(t.content || '').replace(/\s+/g, ' ').slice(0, 160)}…`);
-
-  const claims = extractClaims(session.turns, side);
-  const oppo = recentOpponentPoints(session.turns, side, cfg);
-  const research = researchBlock(session, side);
-
-  const blocks = [
-    `【本轮身份】你是${sideName}辩手「${me?.name || ''}」，担任${me?.role || ''}。`,
-    `【你的风格】${me?.style || ''}`,
-    `【你的长项】${me?.strengths || ''}`,
-    `【你的语言习惯】${me?.tone || ''}`,
-    `【你方立场】${stance}`,
-  ];
-
-  if (myPrevious.length) {
-    blocks.push(`【你此前已经说过的话（不要原样复述，要在此基础上推进）】\n${myPrevious.join('\n')}`);
-  } else {
-    blocks.push('【你此前尚未发言，这是你的首次登场】');
-  }
-
-  if (claims.length) {
-    blocks.push(`【你方已经确立的论点（保持一致，可以深化）】\n${claims.map((c) => `· ${c}`).join('\n')}`);
-  }
-
-  if (oppo.length) {
-    blocks.push(`【对方最近的发言要点（必须针对性回应）】\n${oppo.map((c) => `· ${c}`).join('\n')}`);
-  }
-
-  if (research) blocks.push(research);
-
-  if (session.interventionQueue?.length) {
-    const note = session.interventionQueue[0];
-    blocks.push(`【主席临时提示（必须遵守）】${note}`);
-  }
+  const me = cfg.debaters?.[phase.side]?.find((d) => d.id === phase.speaker);
+  const cap = Math.ceil(phase.words * 1.15);
+  const blocks = [];
 
   blocks.push(
-    `【本轮环节】${phase.title}\n${TASK_BY_TYPE[phase.type] || ''}`
+    `【本轮出场】${phase.speakerLabel}${me ? ` · ${me.name}` : ''} · ${phase.stage}（限时 ${Math.floor(
+      phase.minutes
+    )}:${String(Math.round((phase.minutes % 1) * 60)).padStart(2, '0')}，目标 ${phase.words} 字，硬上限 ${cap} 字）`
   );
-
+  if (me) blocks.push(`【你的说话方式】${me.style}；${me.tone}`);
   blocks.push(
-    `【字数】目标 ${phase.words} 字，**上限 ${Math.ceil(phase.words * 1.15)} 字**。这是照着真人 ${(
-      phase.words / (cfg.wordsPerMinute || 240)
-    ).toFixed(1)} 分钟语速折算出来的，超出上限的部分裁判不计分。宁可少说一句有力的话，也不要为了凑字数注水。`
+    `【本轮环节】按简报第 ${stageNo(phase)} 条「${STAGE_NAME[phase.type] || phase.stage}」的要求写。`
   );
 
+  if (phase.type === 'free' && phase.round) {
+    blocks.push(`【位置】自由辩论第 ${phase.round} 段，${sideName(phase.side)}发言。`);
+  }
+  if (phase.type === 'crossA') {
+    blocks.push(`【对手】上一段是${sideName(phase.side === 'pro' ? 'con' : 'pro')}三辩的质询，逐条接住。`);
+  }
+  if (memoryLine) blocks.push(`【上一场留下的教训】${memoryLine}`);
+  if (intervention) blocks.push(`【主席临时提示（必须回应）】${intervention}`);
+
+  const hint = effortHint(cfg);
+  if (hint) blocks.push(`【要求】${hint}`);
+
+  blocks.push(`【字数】目标 ${phase.words} 字，不得超过 ${cap} 字。按真人 ${phase.minutes} 分钟语速折算，写超了裁判不计分。`);
   return blocks.join('\n\n');
 }
 
-/** 所有调用共享的消息骨架 */
-export function buildMessages({ session, config, taskText, concise }) {
+/** 组合成完整 messages；当前任务永远在最后一条 */
+export function buildMessages({ session, config, taskText }) {
   const cfg = session.config || config;
-  const system = buildGlobalSystem(cfg);
-  let transcript = renderTranscript(session.turns, cfg);
-  if (concise) {
-    // 精简模式牺牲缓存换更短上下文：只保留最近 6 段 + 本方全部发言
-    const done = (session.turns || []).filter((t) => t.status === 'done' && t.content);
-    const own = done.filter((t) => t.side === taskSideOf(taskText));
-    const recent = done.slice(-6);
-    const keep = [...new Set([...own, ...recent])].sort((a, b) => a.order - b.order);
-    transcript = renderTranscript(keep, cfg);
-  }
-  return [
-    { role: 'system', content: system },
-    { role: 'user', content: transcript },
-    { role: 'user', content: taskText },
+  const messages = [
+    { role: 'system', content: buildGlobalSystem(cfg) },
+    { role: 'user', content: session.brief || buildBrief(session, cfg) },
+    ...buildHistory(session),
   ];
+  if (taskText) messages.push({ role: 'user', content: taskText });
+  return messages;
 }
 
-function taskSideOf(task) {
-  if (task.includes('【本轮身份】你是正方')) return 'pro';
-  if (task.includes('【本轮身份】你是反方')) return 'con';
-  return 'pro';
-}
-
-/* ---------------- 检索关键词 ---------------- */
+/* ================= 资料检索 ================= */
 
 export function buildResearchTask(session, config) {
   const cfg = session.config || config;
-  return `【任务】为这场辩论准备资料。辩题：${cfg.topic}
+  return `为下面这场辩论准备检索式。
 
-正方主张：${cfg.proStance}
-反方主张：${cfg.conStance}
-
-请输出 ${cfg.searchQueries || 5} 条中文检索式，用于在搜索引擎上查找**权威**资料（学术论文、教育部门政策、权威机构报告、认知科学/教育心理学研究）。
-要求：
-1. 每条检索式不超过 20 字，尽量带上机构名或"研究""报告""数据"等限定词；
-2. 覆盖正方与反方各至少 2 条，其余的找双方都会用到的中性事实；
-3. 只输出检索式本身，每行一条，不要编号，不要解释。`;
-}
-
-/* ---------------- 裁判 ---------------- */
-
-export function buildJudgeTask(session, config) {
-  const cfg = session.config || config;
-  return `【任务】你是本场辩论的独立裁判。请根据上面的完整实录作出裁定。
-
-${cfg.topic}
+辩题：${cfg.topic}
 正方：${cfg.proStance}
 反方：${cfg.conStance}
 
-请严格按以下格式输出，不要添加额外章节：
+输出 ${cfg.searchQueries || 5} 条中文检索式，用于查找权威资料（学术论文、教育部门政策、认知科学与教育心理学研究、权威机构报告）。
+要求：
+1. 每条不超过 20 字，尽量带「研究」「报告」「数据」「元分析」等限定词；
+2. 支持正方与支持反方各至少 2 条，其余找双方都会用到的中性事实；
+3. 只输出检索式，每行一条，不要编号、不要解释。`;
+}
+
+/* ================= 裁判 ================= */
+
+export function buildJudgeTask(session, config) {
+  const cfg = session.config || config;
+  return `【任务】你现在是本场辩论的独立裁判。请依据上面的完整实录作出裁定，不要偏袒任何一方。
+
+辩题：${cfg.topic}
+正方：${cfg.proStance}
+反方：${cfg.conStance}
+
+严格按下面的格式输出，不要增加其他章节：
 
 ## 裁定
-胜方：正方 / 反方（二选一，必须明确）
-比分：正方 X : Y 反方（百分制整数）
+胜方：正方 / 反方
+比分：正方 X : Y 反方（百分制）
 一句话理由：
 
 ## 三个决胜交锋点
 1. 争点：……｜正方表现：……｜反方表现：……｜归属：……
-2. （同上）
-3. （同上）
+2. 同上
+3. 同上
 
 ## 双方最强与最弱
 正方最强的一击：
@@ -237,30 +246,51 @@ ${cfg.topic}
 反方最大的漏洞：
 
 ## 未被回答的问题
-列出全场至少两个被提出但始终没人正面回答的问题。
+列出全场至少两个被提出、但始终没人正面回答的问题，注明是谁提出的。
 
-## 哪一方更有可能说服真实听众
-给出判断和理由，200 字以内。`;
+## 谁更能说服真实听众
+给出判断与理由，200 字以内。注意：论证自洽度与听众感染力是两件事，请分别评价。`;
 }
 
-/* ---------------- 报告 ---------------- */
+/* ================= 报告 ================= */
 
 export function buildReportTask(session, config, judgeText) {
   const cfg = session.config || config;
-  return `【任务】把本场辩论整理成一份可以直接给人看的复盘报告，用 Markdown 输出。
+  return `【任务】把上面这场辩论整理成一份给人看的复盘报告，用 Markdown 输出。
 
-硬性格式要求：
-- 必须用 \`##\` 二级标题分节，节标题就叫「一、辩题与赛制」「二、双方论证骨架」「三、交锋复盘」「四、裁判结论」「五、资料出处」「六、给高中生的可操作建议」，六节一个都不能少；
-- 总篇幅控制在 2200–3000 字，宁可精炼，不要注水；不要重复开场白，不要写"以上是报告"这类收尾话。
+硬性格式：
+- 必须用 \`##\` 二级标题分六节，标题就叫「一、辩题与赛制」「二、双方论证骨架」「三、交锋复盘」「四、裁判结论」「五、资料出处」「六、给高中生的可操作建议」，一节都不能少；
+- 总篇幅 2200–3200 字，宁可精炼，不要注水；不要开场白，不要「以上是报告」这类收尾。
 
 各节要求：
-- **一、辩题与赛制**：一句话说清辩题、双方立场、赛制轮次、双方各自立的判准。
-- **二、双方论证骨架**：正方、反方各列 3-4 个论点，每个论点一句话概括 + 用到的关键论据（带机构与年份）。
-- **三、交锋复盘**：按自由辩论轮次，逐轮写"攻方用了什么、守方怎么接、这一轮谁占上风"，每轮 3-5 行。质询环节单独一段。
-- **四、裁判结论**：引用下面裁判意见的核心（胜负、比分、三个决胜点），不要照抄全文。
-- **五、资料出处**：把实录里出现过的来源整理成编号列表，格式《标题》— 机构/站点，有 URL 就写上。不得新增未出现过的来源。
-- **六、给高中生的可操作建议**：5 条，具体到行为（什么时候用、怎么问、什么时候必须停），不要空话。
+- 一、辩题与赛制：说清辩题、双方立场、赛制与轮次、双方各自立的判准。
+- 二、双方论证骨架：正反各 3-4 个论点，每个一句话概括 + 关键论据（带机构与年份）。
+- 三、交锋复盘：按自由辩论逐轮写「攻方用了什么、守方怎么接、这一轮谁占上风」；质询与质询小结单独成段。要写具体的攻防，不要写「双方进行了激烈交锋」这种空话。
+- 四、裁判结论：提炼下面的裁判意见（胜负、比分、三个决胜点），不要照抄全文。
+- 五、资料出处：只整理实录与资料库里真实出现过的来源，格式《标题》— 机构/站点，有链接就写上。不得新增未出现过的来源。
+- 六、给高中生的可操作建议：5 条，具体到行为（什么时候用、怎么问、什么时候必须停），不要空话。
 
-裁判意见原文（供第四节引用）：
-${judgeText}`;
+裁判意见原文：
+${judgeText || '（无）'}`;
+}
+
+/* ================= 赛后复盘（写入跨场记忆） ================= */
+
+export function buildReviewTask(session, config) {
+  const cfg = session.config || config;
+  const roster = [];
+  for (const side of ['pro', 'con']) {
+    for (const d of cfg.debaters?.[side] || []) roster.push(`${speakerLabel(side, d.id)}｜${d.name}`);
+  }
+  return `【任务】你是这场辩论的复盘教练。为八位辩手各写一条「下场能直接用」的迭代笔记。
+
+按下面的格式输出，每人一行，共八行，顺序与下面一致，不要写别的任何内容：
+
+${roster.map((r) => `${r}｜保持：……｜改进：……｜下场第一句：……`).join('\n')}
+
+要求：
+- 每行总长不超过 90 字；
+- 「保持」写他这场真正有效的做法（具体到某个动作，不要写「论证清晰」）；
+- 「改进」写他被对方打穿或始终没回应的点；
+- 「下场第一句」写成一句可以直接念出来的开场句，不要写建议。`;
 }

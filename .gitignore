@@ -1,11 +1,14 @@
 # 依赖
 node_modules/
 
-# 运行时数据：会话记录、报告、密钥，全部只留在本地
+# 运行时数据：会话记录、报告、导出、记忆、密钥，全部只留在本地
 data/
 .env
 .env.local
 *.log
+
+# 本地调试用的截图/脚本
+.shots/
 
 # 系统
 .DS_Store
@@ -16,3 +19,6 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# 本地工作记录（不属于产品代码）
+.workbuddy/

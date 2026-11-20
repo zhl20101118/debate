@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { SESSION_DIR, REPORT_DIR, SECRET_FILE, ensureDirs } from './paths.js';
+import { SESSION_DIR, REPORT_DIR, MEMORY_DIR, SECRET_FILE, ensureDirs } from './paths.js';
 
 ensureDirs();
 
@@ -20,18 +20,13 @@ export function writeSecrets(patch) {
   const next = { ...readSecrets(), ...patch };
   fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true });
   fs.writeFileSync(SECRET_FILE, JSON.stringify(next, null, 2), 'utf8');
-  // 尽量收紧权限（Windows 上为 no-op）
   try { fs.chmodSync(SECRET_FILE, 0o600); } catch {}
   return next;
 }
 
-/** 优先级：环境变量 > data/secrets.json > 空 */
+/** 优先级：环境变量 > data/secrets.json */
 export function getApiKey() {
-  return (
-    process.env.DEEPSEEK_API_KEY ||
-    readSecrets().deepseekApiKey ||
-    ''
-  ).trim();
+  return (process.env.DEEPSEEK_API_KEY || readSecrets().deepseekApiKey || '').trim();
 }
 
 export function maskKey(k) {
@@ -78,15 +73,20 @@ export function listSessions() {
       .map((f) => {
         try {
           const s = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), 'utf8'));
+          const done = (s.turns || []).filter((t) => t.status === 'done').length;
+          const total = (s.phases || []).length || 1;
           return {
             id: s.id,
             topic: s.topic,
             status: s.status,
             createdAt: s.createdAt,
             updatedAt: s.updatedAt,
-            progress: `${(s.turns || []).filter((t) => t.status === 'done').length}/${(s.phases || []).length}`,
+            progress: `${done}/${(s.phases || []).length}`,
+            progressRatio: done / total,
             totalTokens: s.usage?.totalTokens || 0,
             cacheHitRate: s.usage?.cacheHitRate || 0,
+            hasReport: Boolean(s.report),
+            turns: done,
           };
         } catch {
           return null;
@@ -123,5 +123,70 @@ export function loadReport(id) {
     return fs.readFileSync(path.join(REPORT_DIR, `${id}.md`), 'utf8');
   } catch {
     return null;
+  }
+}
+
+/* ---------------- 跨场记忆 ---------------- */
+
+function memoryFile(side, id) {
+  return path.join(MEMORY_DIR, `${side}-${id}.json`);
+}
+
+export function readMemory(side, id) {
+  try {
+    return JSON.parse(fs.readFileSync(memoryFile(side, id), 'utf8'));
+  } catch {
+    return { side, id, matches: [] };
+  }
+}
+
+/** 追加一条赛后复盘，只保留最近 keep 场 */
+export function appendMemory(side, id, name, entry, keep = 4) {
+  const cur = readMemory(side, id);
+  cur.side = side;
+  cur.id = id;
+  cur.name = name || cur.name || '';
+  cur.matches = [...(cur.matches || []), entry].slice(-Math.max(1, keep));
+  cur.updatedAt = Date.now();
+  fs.writeFileSync(memoryFile(side, id), JSON.stringify(cur, null, 2), 'utf8');
+  return cur;
+}
+
+export function listMemory() {
+  try {
+    return fs
+      .readdirSync(MEMORY_DIR)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => {
+        try {
+          const m = JSON.parse(fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8'));
+          return {
+            key: f.replace(/\.json$/, ''),
+            side: m.side,
+            id: m.id,
+            name: m.name,
+            count: (m.matches || []).length,
+            last: (m.matches || []).at(-1)?.note || '',
+            updatedAt: m.updatedAt || 0,
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch {
+    return [];
+  }
+}
+
+export function clearMemory() {
+  try {
+    for (const f of fs.readdirSync(MEMORY_DIR)) {
+      if (f.endsWith('.json')) fs.unlinkSync(path.join(MEMORY_DIR, f));
+    }
+    return true;
+  } catch {
+    return false;
   }
 }

@@ -8,14 +8,36 @@ import { ensureConfig, readConfig, writeConfig, resetConfig, DEFAULT_CONFIG } fr
 import {
   saveSession, loadSession, listSessions, deleteSession, loadReport,
   newSessionId, getApiKey, writeSecrets, readSecrets, maskKey,
+  listMemory, clearMemory,
 } from './src/store.js';
 import {
-  createSession, startRunner, controlSession, getRunner, collectSources,
+  createSession, startRunner, controlSession, getRunner, collectSources, setSeriesHandler,
 } from './src/orchestrator.js';
+import { saveExport } from './src/exporter.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
+
+/* ---------------- 会话单例 ----------------
+ * 关键：调度器与 HTTP 控制必须操作同一个对象。
+ * 之前每次请求都 loadSession 出一个新副本，控制按钮改的是副本，
+ * 正在跑的 runner 改的是原对象 —— 暂停/跳过/撤回全部错位。 */
+
+const liveSessions = new Map();
+
+function getSession(id) {
+  if (!/^[a-zA-Z0-9_-]{4,64}$/.test(id)) return null;
+  if (liveSessions.has(id)) return liveSessions.get(id);
+  const s = loadSession(id);
+  if (s) liveSessions.set(id, s);
+  return s;
+}
+
+function putSession(session) {
+  liveSessions.set(session.id, session);
+  return session;
+}
 
 /* ---------------- SSE 总线 ---------------- */
 
@@ -24,7 +46,12 @@ const subscribers = new Map(); // sessionId -> Set(res)
 function broadcast(sessionId, type, data) {
   const set = subscribers.get(sessionId);
   if (!set?.size) return;
-  const payload = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  let payload;
+  try {
+    payload = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  } catch {
+    return;
+  }
   for (const res of set) {
     try { res.write(payload); } catch { set.delete(res); }
   }
@@ -89,10 +116,9 @@ function serveStatic(req, res, pathname) {
   if (!file.startsWith(PUBLIC_DIR)) return sendText(res, 403, 'Forbidden');
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) {
-      // SPA 兜底
       const index = path.join(PUBLIC_DIR, 'index.html');
       if (fs.existsSync(index)) {
-        res.writeHead(200, { 'Content-Type': MIME['.html'] });
+        res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store' });
         fs.createReadStream(index).pipe(res);
       } else {
         sendText(res, 404, 'Not Found');
@@ -101,7 +127,7 @@ function serveStatic(req, res, pathname) {
     }
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-store',
     });
     fs.createReadStream(file).pipe(res);
   });
@@ -118,7 +144,7 @@ async function handle(req, res) {
   const streamMatch = p.match(/^\/api\/sessions\/([\w-]+)\/stream$/);
   if (streamMatch && method === 'GET') {
     const id = streamMatch[1];
-    const session = loadSession(id);
+    const session = getSession(id);
     if (!session) return sendJson(res, 404, { ok: false, message: '会话不存在' });
 
     res.writeHead(200, {
@@ -127,17 +153,15 @@ async function handle(req, res) {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    res.write('retry: 3000\n\n');
-
+    res.write('retry: 2000\n\n');
     if (!subscribers.has(id)) subscribers.set(id, new Set());
     subscribers.get(id).add(res);
 
-    // 连上先给一份快照，避免刷新丢失
     res.write(`event: snapshot\ndata: ${JSON.stringify(publicSession(session))}\n\n`);
 
     const ping = setInterval(() => {
-      try { res.write(': ping\n\n'); } catch {}
-    }, 15000);
+      try { res.write(`: ping ${Date.now()}\n\n`); } catch {}
+    }, 12000);
 
     req.on('close', () => {
       clearInterval(ping);
@@ -148,8 +172,7 @@ async function handle(req, res) {
 
   // ---- 配置 ----
   if (p === '/api/config' && method === 'GET') {
-    const cfg = readConfig();
-    return sendJson(res, 200, { ok: true, config: cfg, defaults: DEFAULT_CONFIG });
+    return sendJson(res, 200, { ok: true, config: readConfig(), defaults: DEFAULT_CONFIG });
   }
   if (p === '/api/config' && method === 'POST') {
     if (!requireAdmin(req, res)) return;
@@ -187,6 +210,16 @@ async function handle(req, res) {
     return sendJson(res, 200, { ok: true, configured: false });
   }
 
+  // ---- 跨场记忆 ----
+  if (p === '/api/memory' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, memory: listMemory() });
+  }
+  if (p === '/api/memory' && method === 'DELETE') {
+    if (!requireAdmin(req, res)) return;
+    clearMemory();
+    return sendJson(res, 200, { ok: true });
+  }
+
   // ---- 会话列表 ----
   if (p === '/api/sessions' && method === 'GET') {
     return sendJson(res, 200, { ok: true, sessions: listSessions() });
@@ -197,16 +230,13 @@ async function handle(req, res) {
     const body = await readBody(req);
     const cfg = writeConfig(body.config || {});
     const id = newSessionId();
-    const session = createSession(cfg, { id });
-    if (body.autoStart) {
-      session.status = 'running';
-    }
+    const session = putSession(createSession(cfg, { id }));
+    if (body.autoStart) session.status = 'running';
     saveSession(session);
 
-    const emit = makeEmitter(id);
     if (body.autoStart) {
-      // 稍等前端建立 SSE 再开跑
-      setTimeout(() => startRunner(session, emit), 600);
+      const emit = makeEmitter(id);
+      setTimeout(() => startRunner(session, emit), 400);
     }
     return sendJson(res, 200, { ok: true, id, session: publicSession(session) });
   }
@@ -215,12 +245,12 @@ async function handle(req, res) {
   const one = p.match(/^\/api\/sessions\/([\w-]+)$/);
   if (one) {
     const id = one[1];
-    const session = loadSession(id);
+    const session = getSession(id);
     if (!session) return sendJson(res, 404, { ok: false, message: '会话不存在' });
 
     if (method === 'GET') {
-      // 服务器重启过：把「running」纠正为 paused，避免假装在跑
-      if ((session.status === 'running' || session.status === 'researching') && !getRunner(id)) {
+      // 服务重启后残留的 running 状态纠正为 paused（没有 runner 就是没在跑）
+      if (['running', 'researching', 'judging'].includes(session.status) && !getRunner(id)) {
         session.status = 'paused';
         saveSession(session);
       }
@@ -229,6 +259,7 @@ async function handle(req, res) {
     if (method === 'DELETE') {
       const r = getRunner(id);
       if (r) r.abort();
+      liveSessions.delete(id);
       deleteSession(id);
       return sendJson(res, 200, { ok: true });
     }
@@ -239,14 +270,18 @@ async function handle(req, res) {
   if (ctl && method === 'POST') {
     if (!requireAdmin(req, res)) return;
     const id = ctl[1];
-    const session = loadSession(id);
+    const session = getSession(id);
     if (!session) return sendJson(res, 404, { ok: false, message: '会话不存在' });
     const body = await readBody(req);
     const emit = makeEmitter(id);
     try {
       const out = controlSession(session, String(body.action || ''), body, emit);
       saveSession(session);
-      return sendJson(res, 200, { ok: out.ok !== false, message: out.message || '', session: publicSession(session) });
+      return sendJson(res, 200, {
+        ok: out.ok !== false,
+        message: out.message || '',
+        session: publicSession(session),
+      });
     } catch (e) {
       return sendJson(res, 500, { ok: false, message: e.message });
     }
@@ -268,24 +303,46 @@ async function handle(req, res) {
     return sendText(res, 200, md, 'text/markdown; charset=utf-8');
   }
 
+  // ---- 完整实录导出 ----
+  const exp = p.match(/^\/api\/sessions\/([\w-]+)\/export$/);
+  if (exp && method === 'GET') {
+    const session = getSession(exp[1]);
+    if (!session) return sendJson(res, 404, { ok: false, message: '会话不存在' });
+    const { file, md } = saveExport(session);
+    if (url.searchParams.get('download')) {
+      res.writeHead(200, {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Disposition': `attachment; filename="debate-${session.id}-full.md"`,
+      });
+      return res.end(md);
+    }
+    return sendJson(res, 200, { ok: true, file, markdown: md });
+  }
+
   // ---- 来源 ----
   const src = p.match(/^\/api\/sessions\/([\w-]+)\/sources$/);
   if (src && method === 'GET') {
-    const session = loadSession(src[1]);
+    const session = getSession(src[1]);
     if (!session) return sendJson(res, 404, { ok: false, message: '会话不存在' });
     return sendJson(res, 200, { ok: true, sources: collectSources(session) });
   }
 
   // ---- 健康检查 ----
   if (p === '/api/health') {
-    return sendJson(res, 200, { ok: true, uptime: process.uptime(), adminRequired: Boolean(ADMIN_TOKEN) });
+    return sendJson(res, 200, {
+      ok: true,
+      uptime: process.uptime(),
+      adminRequired: Boolean(ADMIN_TOKEN),
+      sessions: liveSessions.size,
+      running: [...liveSessions.values()].filter((s) => ['running', 'researching', 'judging'].includes(s.status)).length,
+    });
   }
 
   if (p.startsWith('/api/')) return sendJson(res, 404, { ok: false, message: '接口不存在' });
   return serveStatic(req, res, p);
 }
 
-/** 去掉不需要发给前端的字段，减小体积 */
+/** 发给前端的数据：去掉 brief（很大）、judgeStream 等中间态 */
 function publicSession(s) {
   return {
     id: s.id,
@@ -298,9 +355,13 @@ function publicSession(s) {
       rounds: s.config.rounds,
       wordsPerMinute: s.config.wordsPerMinute,
       searchEnabled: s.config.searchEnabled,
-      conciseContext: s.config.conciseContext,
       proStance: s.config.proStance,
       conStance: s.config.conStance,
+      judgeEnabled: s.config.judgeEnabled,
+      autoReport: s.config.autoReport,
+      memory: s.config.memory,
+      seriesMatches: s.config.seriesMatches,
+      debaters: s.config.debaters,
     },
     phases: s.phases,
     turns: s.turns,
@@ -308,7 +369,12 @@ function publicSession(s) {
     status: s.status,
     currentPhaseIndex: s.currentPhaseIndex,
     judge: s.judge,
+    judgeStream: s.judgeStream || '',
+    live: s.live || null,
     report: s.report,
+    reviewNotes: s.reviewNotes || [],
+    series: s.series,
+    stats: s.stats,
     error: s.error,
     usage: s.usage,
   };
@@ -328,6 +394,18 @@ function localIPs() {
 
 function main() {
   ensureConfig();
+
+  // 系列赛：一场结束后自动开下一场，辩手带着刚写入的记忆上场
+  setSeriesHandler(({ config, index, total, fromId }) => {
+    const id = newSessionId();
+    const session = putSession(createSession(config, { id, seriesIndex: index }));
+    saveSession(session);
+    const emit = makeEmitter(id);
+    broadcast(fromId, 'navigate', { id, index, total });
+    setTimeout(() => startRunner(session, emit), 800);
+    console.log(`[series] 第 ${index}/${total} 场开始：${id}`);
+  });
+
   const server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
       console.error('[error]', e);
@@ -340,7 +418,7 @@ function main() {
     const ips = localIPs();
     console.log('');
     console.log('  ╔══════════════════════════════════════════╗');
-    console.log('  ║        AI 辩论室 · 4 v 4 已启动          ║');
+    console.log('  ║      AI 辩论室 · 四对四标准赛制          ║');
     console.log('  ╚══════════════════════════════════════════╝');
     console.log('');
     console.log(`  本机访问 : http://localhost:${PORT}`);
